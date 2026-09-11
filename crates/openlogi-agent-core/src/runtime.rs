@@ -31,21 +31,21 @@ use crate::{DpiCycleState, DpiCycles};
 /// map gives release, cancellation, invalidation, shutdown, and unwinding one
 /// RAII path.
 #[derive(Default)]
-struct HeldShortcuts {
-    by_press: HashMap<PressToken, openlogi_inject::HeldChord>,
+struct HeldInputs {
+    by_press: HashMap<PressToken, openlogi_inject::HeldInputGuard>,
 }
 
-impl HeldShortcuts {
+impl HeldInputs {
     fn start(&mut self, press: &PressToken, action: &Action) -> bool {
-        let Some(combo) = action.held_combo() else {
+        let Some(input) = action.held_input() else {
             return false;
         };
         match self.by_press.entry(press.clone()) {
             std::collections::hash_map::Entry::Occupied(mut held) => {
-                held.get_mut().replace(combo);
+                held.get_mut().replace(input);
             }
             std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(openlogi_inject::press_hold(combo));
+                slot.insert(openlogi_inject::press_hold(input));
             }
         }
         true
@@ -152,14 +152,14 @@ impl ActionExecutor {
 
 struct ButtonEventHandler {
     executor: ActionExecutor,
-    held: HeldShortcuts,
+    held: HeldInputs,
 }
 
 impl ButtonEventHandler {
     fn new(executor: ActionExecutor) -> Self {
         Self {
             executor,
-            held: HeldShortcuts::default(),
+            held: HeldInputs::default(),
         }
     }
 
@@ -171,9 +171,30 @@ impl ButtonEventHandler {
                 }
             }
             ButtonRuntimeEvent::Triggered { press, action } => {
-                self.start_action(press.token(), &action, press.device_key());
+                // Globe is a direct press binding, not a gesture/long-press
+                // outcome (which may arrive only once the button is released).
+                if action.requires_physical_release() {
+                    warn!(
+                        action = "HoldGlobeKey",
+                        reason = "deferred_trigger",
+                        "held input rejected"
+                    );
+                } else {
+                    self.start_action(press.token(), &action, press.device_key());
+                }
             }
             ButtonRuntimeEvent::Ended { press, reason } => {
+                if press
+                    .start_action()
+                    .is_some_and(Action::requires_physical_release)
+                {
+                    info!(
+                        action = "HoldGlobeKey",
+                        press = press.token().sequence(),
+                        ?reason,
+                        "physical hold ended; releasing owned output"
+                    );
+                }
                 self.held.end(press.token());
                 if let EndReason::Canceled(reason) = reason {
                     match press.control() {
@@ -190,6 +211,13 @@ impl ButtonEventHandler {
     }
 
     fn start_action(&mut self, press: &PressToken, action: &Action, device_key: Option<&str>) {
+        if action.requires_physical_release() {
+            info!(
+                action = "HoldGlobeKey",
+                press = press.sequence(),
+                "physical hold accepted; submitting keyboard output"
+            );
+        }
         if !self.held.start(press, action) {
             self.executor.dispatch(action, device_key);
         }
@@ -380,7 +408,7 @@ mod tests {
     #[test]
     fn instantaneous_actions_do_not_enter_held_state() {
         let press = PressToken::hook_for_test(1, ButtonId::Back);
-        let mut held = HeldShortcuts::default();
+        let mut held = HeldInputs::default();
 
         assert!(!held.start(&press, &Action::Copy));
         held.end(&press);

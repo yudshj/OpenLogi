@@ -152,6 +152,13 @@ pub(crate) struct PressToken {
     generation: u64,
 }
 
+impl PressToken {
+    /// Process-local correlation number, without capture/device identity.
+    pub(crate) fn sequence(&self) -> u64 {
+        self.id.0
+    }
+}
+
 #[cfg(test)]
 impl PressToken {
     pub(crate) fn hook_for_test(id: u64, button: ButtonId) -> Self {
@@ -480,6 +487,14 @@ impl ButtonInputHandle {
         button: ButtonId,
         binding: Option<&Binding>,
     ) -> bool {
+        if binding.is_some_and(|binding| binding.click_action().requires_physical_release()) {
+            warn!(
+                action = "HoldGlobeKey",
+                reason = "pulse_only_source",
+                "held input rejected"
+            );
+            return false;
+        }
         let generation = self.generation.load(Ordering::Acquire);
         let press = self.new_press(
             PressKey::new(ButtonSource::Hidpp(session.clone()), button),
