@@ -2,7 +2,9 @@
 
 use std::time::Instant;
 
-use openlogi_core::binding::LongPressBinding;
+use openlogi_core::binding::{
+    ButtonActions, DOUBLE_CLICK_HOLD_THRESHOLD, KeyCombo, LONG_PRESS_THRESHOLD, LongPressBinding,
+};
 
 use super::*;
 
@@ -10,6 +12,7 @@ fn hook_press(id: u64, button: ButtonId) -> ActivePress {
     ActivePress {
         token: PressToken::hook_for_test(id, button),
         behavior: PressBehavior::Immediate(Action::Copy),
+        target: ActionDispatchTarget::Keyboard,
     }
 }
 
@@ -65,6 +68,7 @@ fn cancellation_is_scoped_to_one_session() {
             generation: 0,
         },
         behavior: PressBehavior::LifecycleOnly,
+        target: ActionDispatchTarget::Keyboard,
     };
     let second = ActivePress {
         token: PressToken {
@@ -73,6 +77,7 @@ fn cancellation_is_scoped_to_one_session() {
             generation: 0,
         },
         behavior: PressBehavior::LifecycleOnly,
+        target: ActionDispatchTarget::Keyboard,
     };
     state.press(first.clone());
     state.press(second.clone());
@@ -95,6 +100,7 @@ fn hook_cancellation_leaves_hidpp_presses_active() {
             generation: 0,
         },
         behavior: PressBehavior::LifecycleOnly,
+        target: ActionDispatchTarget::Keyboard,
     };
     state.press(hook.clone());
     state.press(hidpp.clone());
@@ -146,6 +152,86 @@ fn stale_token_cannot_trigger_after_same_key_repress() {
 }
 
 #[test]
+fn hook_actions_retain_the_press_time_target_across_focus_changes() {
+    let (sent, received) = mpsc::channel();
+    let mut owner = ButtonRuntimeOwner::spawn(move |event| {
+        sent.send(event)
+            .expect("test receiver should stay connected");
+    })
+    .expect("button worker should start");
+    let input = owner.input();
+    let target = ActionDispatchTarget::SafariProcess(417);
+    let token = input
+        .try_hook_down_with_target(ButtonId::Back, None, target)
+        .expect("Safari down should be queued");
+    let ButtonRuntimeEvent::Started(started) = recv_event(&received) else {
+        panic!("down should start the press lifecycle");
+    };
+    assert_eq!(started.target(), target);
+
+    input
+        .try_hook_down_with_target(ButtonId::Forward, None, ActionDispatchTarget::Keyboard)
+        .expect("post-focus-change down should be queued");
+    assert!(matches!(
+        recv_event(&received),
+        ButtonRuntimeEvent::Started(ActivePress {
+            target: ActionDispatchTarget::Keyboard,
+            ..
+        })
+    ));
+
+    assert!(input.try_trigger_while_pressed(&token, &Action::BrowserBack));
+    let ButtonRuntimeEvent::Triggered { press, action } = recv_event(&received) else {
+        panic!("queued browser action should retain its originating press");
+    };
+    assert_eq!(press.target(), target);
+    assert_eq!(action, Action::BrowserBack);
+    assert!(owner.shutdown());
+}
+
+#[test]
+fn hidpp_edges_and_pulses_retain_their_press_time_targets() {
+    let (sent, received) = mpsc::channel();
+    let mut owner = ButtonRuntimeOwner::spawn(move |event| {
+        sent.send(event)
+            .expect("test receiver should stay connected");
+    })
+    .expect("button worker should start");
+    let input = owner.input();
+    let session = HidppSessionId::with_epoch("mouse-a", 7);
+    let safari = ActionDispatchTarget::SafariProcess(417);
+
+    input
+        .try_hidpp_down(&session, ButtonId::Back, None, safari)
+        .expect("HID++ down should be queued");
+    let ButtonRuntimeEvent::Started(started) = recv_event(&received) else {
+        panic!("HID++ down should start a lifecycle");
+    };
+    assert_eq!(started.target(), safari);
+    assert!(input.try_hidpp_up(&session, ButtonId::Back));
+    assert!(matches!(
+        recv_event(&received),
+        ButtonRuntimeEvent::Ended { .. }
+    ));
+
+    assert!(input.try_hidpp_pulse(
+        &session,
+        ButtonId::Forward,
+        None,
+        ActionDispatchTarget::Keyboard,
+    ));
+    let ButtonRuntimeEvent::Started(started) = recv_event(&received) else {
+        panic!("HID++ pulse should start a lifecycle");
+    };
+    assert_eq!(started.target(), ActionDispatchTarget::Keyboard);
+    assert!(matches!(
+        recv_event(&received),
+        ButtonRuntimeEvent::Ended { .. }
+    ));
+    assert!(owner.shutdown());
+}
+
+#[test]
 fn source_cancellation_invalidates_queued_gesture_work() {
     let (sent, received) = mpsc::channel();
     let mut owner = ButtonRuntimeOwner::spawn(move |event| {
@@ -156,7 +242,12 @@ fn source_cancellation_invalidates_queued_gesture_work() {
     let input = owner.input();
     let session = HidppSessionId::with_epoch("mouse-a", 7);
     let token = input
-        .try_hidpp_down(&session, ButtonId::Back, None)
+        .try_hidpp_down(
+            &session,
+            ButtonId::Back,
+            None,
+            ActionDispatchTarget::Keyboard,
+        )
         .expect("down should be queued");
     assert!(matches!(
         recv_event(&received),
@@ -278,7 +369,12 @@ fn pulse_has_an_immediate_balanced_lifecycle() {
     let binding = Binding::Single(Action::HoldShortcut(
         "Ctrl+Space".parse().expect("valid shortcut"),
     ));
-    assert!(input.try_hidpp_pulse(&session, ButtonId::Back, Some(&binding)));
+    assert!(input.try_hidpp_pulse(
+        &session,
+        ButtonId::Back,
+        Some(&binding),
+        ActionDispatchTarget::Keyboard,
+    ));
 
     let ButtonRuntimeEvent::Started(started) = recv_event(&received) else {
         panic!("pulse must start before ending");
@@ -299,6 +395,7 @@ fn release_before_long_press_threshold_fires_only_the_short_action() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        target: ActionDispatchTarget::Keyboard,
     };
     state.press(press.clone());
     let mut events = Vec::new();
@@ -337,6 +434,7 @@ fn threshold_fires_long_once_and_suppresses_short_on_release() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        target: ActionDispatchTarget::Keyboard,
     };
     state.press(press.clone());
     let mut events = Vec::new();
@@ -385,6 +483,7 @@ fn cancellation_never_fires_a_pending_short_or_long_action() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        target: ActionDispatchTarget::Keyboard,
     };
     state.press(press);
     let mut events = Vec::new();
@@ -422,7 +521,12 @@ fn pulse_degrades_long_press_to_its_short_action() {
     let session = HidppSessionId::with_epoch("keyboard-a", 4);
     let binding = long_press(Action::Copy, Action::Paste);
 
-    assert!(input.try_hidpp_pulse(&session, ButtonId::Back, Some(&binding)));
+    assert!(input.try_hidpp_pulse(
+        &session,
+        ButtonId::Back,
+        Some(&binding),
+        ActionDispatchTarget::Keyboard,
+    ));
     assert!(matches!(
         recv_event(&received),
         ButtonRuntimeEvent::Started(_)
@@ -493,6 +597,7 @@ fn overdue_long_press_precedes_unrelated_queued_actions() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        target: ActionDispatchTarget::Keyboard,
     };
     state.press(press.clone());
     commands
@@ -554,6 +659,7 @@ fn continuous_commands_cannot_starve_a_long_press_deadline() {
             input: ButtonInput::Down(ActivePress {
                 token: PressToken::hook_for_test(1, ButtonId::Back),
                 behavior: PressBehavior::new(Some(&binding), pressed_at),
+                target: ActionDispatchTarget::Keyboard,
             }),
         })
         .expect("test queue should accept the press");
@@ -700,6 +806,141 @@ fn a_release_observed_before_the_threshold_wins_despite_worker_backlog() {
 }
 
 #[test]
+fn globe_starts_on_down_and_recovers_after_every_terminal_path() {
+    let (sent, received) = mpsc::channel();
+    let mut owner = ButtonRuntimeOwner::spawn(move |event| {
+        sent.send(event).unwrap();
+    })
+    .unwrap();
+    let input = owner.input();
+    let binding = Binding::Single(Action::HoldGlobeKey);
+
+    // No release or clock advance is needed to start a single-action hold.
+    for _ in 0..3 {
+        let token = input.try_hook_down(ButtonId::Back, Some(&binding)).unwrap();
+        let ButtonRuntimeEvent::Started(press) = recv_event(&received) else {
+            panic!("start expected");
+        };
+        assert_eq!(press.token, token);
+        assert_eq!(press.start_action(), Some(&Action::HoldGlobeKey));
+        assert_eq!(press.behavior.deadline(), None);
+        assert!(input.try_hook_up(ButtonId::Back));
+        let ButtonRuntimeEvent::Ended { press, reason } = recv_event(&received) else {
+            panic!("release expected");
+        };
+        assert_eq!(press.token, token);
+        assert_eq!(reason, EndReason::Released);
+    }
+    for reason in [
+        CancelReason::SourceEnded,
+        CancelReason::Invalidated,
+        CancelReason::Shutdown,
+    ] {
+        let token = input.try_hook_down(ButtonId::Back, Some(&binding)).unwrap();
+        assert!(matches!(
+            recv_event(&received),
+            ButtonRuntimeEvent::Started(_)
+        ));
+        match reason {
+            CancelReason::SourceEnded => input.cancel_hook_thread(),
+            CancelReason::Invalidated => input.invalidate_all(),
+            CancelReason::Shutdown => {
+                assert!(owner.shutdown());
+            }
+            _ => unreachable!(),
+        }
+        let ButtonRuntimeEvent::Ended {
+            press,
+            reason: actual,
+        } = recv_event(&received)
+        else {
+            panic!("cancel expected");
+        };
+        assert_eq!(press.token, token);
+        assert_eq!(actual, EndReason::Canceled(reason));
+    }
+    assert!(
+        received.try_recv().is_err(),
+        "each press has exactly one terminal event"
+    );
+}
+
+#[test]
+fn globe_hidpp_disconnect_does_not_end_another_devices_hold() {
+    let (sent, received) = mpsc::channel();
+    let mut owner = ButtonRuntimeOwner::spawn(move |event| {
+        sent.send(event).unwrap();
+    })
+    .unwrap();
+    let input = owner.input();
+    let binding = Binding::Single(Action::HoldGlobeKey);
+    let first = HidppSessionId::with_epoch("mouse-a", 1);
+    let second = HidppSessionId::with_epoch("mouse-b", 2);
+    let a = input
+        .try_hidpp_down(
+            &first,
+            ButtonId::Back,
+            Some(&binding),
+            ActionDispatchTarget::Keyboard,
+        )
+        .unwrap();
+    let b = input
+        .try_hidpp_down(
+            &second,
+            ButtonId::Back,
+            Some(&binding),
+            ActionDispatchTarget::Keyboard,
+        )
+        .unwrap();
+    for _ in 0..2 {
+        let ButtonRuntimeEvent::Started(press) = recv_event(&received) else {
+            panic!("start expected");
+        };
+        assert_eq!(press.start_action(), Some(&Action::HoldGlobeKey));
+    }
+    input.cancel_hidpp_session(&first);
+    let ButtonRuntimeEvent::Ended { press, reason } = recv_event(&received) else {
+        panic!("cancel expected");
+    };
+    assert_eq!(press.token, a);
+    assert_eq!(reason, EndReason::Canceled(CancelReason::SourceEnded));
+    assert!(input.try_hidpp_up(&second, ButtonId::Back));
+    let ButtonRuntimeEvent::Ended { press, reason } = recv_event(&received) else {
+        panic!("release expected");
+    };
+    assert_eq!(press.token, b);
+    assert_eq!(reason, EndReason::Released);
+    assert!(owner.shutdown());
+}
+
+#[test]
+fn globe_rejects_pulse_only_hardware() {
+    let (sent, received) = mpsc::channel();
+    let mut owner = ButtonRuntimeOwner::spawn(move |event| {
+        sent.send(event).unwrap();
+    })
+    .unwrap();
+    let input = owner.input();
+    let session = HidppSessionId::with_epoch("mouse", 1);
+    for binding in [
+        Binding::Single(Action::HoldGlobeKey),
+        long_press(Action::HoldGlobeKey, Action::Copy),
+    ] {
+        assert!(!input.try_hidpp_pulse(
+            &session,
+            ButtonId::Back,
+            Some(&binding),
+            ActionDispatchTarget::Keyboard
+        ));
+    }
+    assert!(owner.shutdown());
+    assert!(
+        received.try_recv().is_err(),
+        "a pulse must not open and immediately close voice input"
+    );
+}
+
+#[test]
 fn function_key_hold_has_one_balanced_lifecycle() {
     let (sent, received) = mpsc::channel();
     let mut owner = ButtonRuntimeOwner::spawn(move |event| {
@@ -710,7 +951,7 @@ fn function_key_hold_has_one_balanced_lifecycle() {
     let input = owner.input();
     let action = Action::HoldShortcut("Ctrl+Space".parse().expect("valid shortcut"));
     let token = input
-        .try_hook_key_down(0x7a, &action)
+        .try_hook_key_down(0x7a, &action, ActionDispatchTarget::Keyboard)
         .expect("key down should be queued");
 
     let ButtonRuntimeEvent::Started(started) = recv_event(&received) else {
@@ -777,4 +1018,317 @@ fn shutdown_deadline_includes_a_blocked_terminal_handler() {
     assert!(!owner.shutdown_with_timeout(Duration::from_millis(20)));
     assert!(started.elapsed() < Duration::from_millis(200));
     let _ = release_tx.send(());
+}
+
+fn double_click_press(id: u64, at: Instant) -> ActivePress {
+    let mut press = hook_press(id, ButtonId::DpiToggle);
+    let binding = ButtonActions::new(
+        Action::None,
+        Action::HoldShortcut(KeyCombo::FN),
+        Action::CustomShortcut("Ctrl+Alt+Shift+T".parse().unwrap()),
+    )
+    .into_binding();
+    press.behavior = PressBehavior::new(Some(&binding), at);
+    press
+}
+
+fn input_at(
+    state: &mut ButtonState,
+    press: &ActivePress,
+    release: Option<Instant>,
+    events: &mut Vec<ButtonRuntimeEvent>,
+) {
+    let input = release.map_or_else(
+        || ButtonInput::Down(press.clone()),
+        |released_at| ButtonInput::Up {
+            key: press.token.key.clone(),
+            released_at,
+        },
+    );
+    process_input(state, input, &mut |event| events.push(event));
+}
+
+fn output_actions(events: &[ButtonRuntimeEvent]) -> Vec<Action> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ButtonRuntimeEvent::Triggered { action, .. } if *action != Action::None => {
+                Some(action.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn double_click_gap_is_inclusive_and_single_clicks_do_nothing() {
+    let now = Instant::now();
+    for gap in [199, 200, 201] {
+        let mut state = ButtonState::default();
+        let mut events = Vec::new();
+        let first = double_click_press(1, now);
+        let released = now + Duration::from_millis(40);
+        input_at(&mut state, &first, None, &mut events);
+        input_at(&mut state, &first, Some(released), &mut events);
+        let second_at = released + Duration::from_millis(gap);
+        let second = double_click_press(2, second_at);
+        input_at(&mut state, &second, None, &mut events);
+        input_at(
+            &mut state,
+            &second,
+            Some(second_at + Duration::from_millis(40)),
+            &mut events,
+        );
+        emit_due_long_presses(&mut state, now + Duration::from_secs(1), &mut |event| {
+            events.push(event);
+        });
+        let expected = if gap <= 200 {
+            vec![Action::CustomShortcut("Ctrl+Alt+Shift+T".parse().unwrap())]
+        } else {
+            vec![]
+        };
+        assert_eq!(output_actions(&events), expected, "gap {gap}");
+        assert!(state.active.is_empty());
+        assert!(state.waiting.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ButtonRuntimeEvent::Ended { .. }))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn double_click_globe_hold_starts_at_300_ms_and_ends_on_release() {
+    let now = Instant::now();
+    let mut state = ButtonState::default();
+    let mut events = Vec::new();
+    let press = double_click_press(1, now);
+    input_at(&mut state, &press, None, &mut events);
+    emit_due_long_presses(&mut state, now + Duration::from_millis(299), &mut |event| {
+        events.push(event);
+    });
+    assert!(output_actions(&events).is_empty());
+    emit_due_long_presses(
+        &mut state,
+        now + DOUBLE_CLICK_HOLD_THRESHOLD,
+        &mut |event| events.push(event),
+    );
+    assert_eq!(
+        output_actions(&events),
+        vec![Action::HoldShortcut(KeyCombo::FN)]
+    );
+    assert!(
+        matches!(events.last(), Some(ButtonRuntimeEvent::Triggered { press, .. }) if press.is_long_fired())
+    );
+    input_at(
+        &mut state,
+        &press,
+        Some(now + Duration::from_millis(700)),
+        &mut events,
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ButtonRuntimeEvent::Ended {
+            reason: EndReason::Released,
+            ..
+        })
+    ));
+    assert_eq!(
+        output_actions(&events),
+        vec![Action::HoldShortcut(KeyCombo::FN)]
+    );
+    assert!(state.waiting.is_empty());
+}
+
+#[test]
+fn holding_second_click_suppresses_the_shortcut() {
+    let now = Instant::now();
+    let mut state = ButtonState::default();
+    let mut events = Vec::new();
+    let first = double_click_press(1, now);
+    input_at(&mut state, &first, None, &mut events);
+    input_at(
+        &mut state,
+        &first,
+        Some(now + Duration::from_millis(30)),
+        &mut events,
+    );
+    let second = double_click_press(2, now + Duration::from_millis(100));
+    input_at(&mut state, &second, None, &mut events);
+    emit_due_long_presses(&mut state, now + Duration::from_millis(400), &mut |event| {
+        events.push(event);
+    });
+    input_at(
+        &mut state,
+        &second,
+        Some(now + Duration::from_millis(450)),
+        &mut events,
+    );
+    assert_eq!(
+        output_actions(&events),
+        vec![Action::HoldShortcut(KeyCombo::FN)]
+    );
+}
+
+#[test]
+fn released_globe_hold_is_not_injected_late_after_worker_backlog() {
+    let now = Instant::now();
+    let mut state = ButtonState::default();
+    let mut events = Vec::new();
+    let press = double_click_press(1, now);
+    input_at(&mut state, &press, None, &mut events);
+    input_at(
+        &mut state,
+        &press,
+        Some(now + Duration::from_millis(350)),
+        &mut events,
+    );
+    emit_due_long_presses(&mut state, now + Duration::from_secs(1), &mut |event| {
+        events.push(event);
+    });
+    assert!(output_actions(&events).is_empty());
+    assert!(state.active.is_empty());
+    assert!(state.waiting.is_empty());
+}
+
+#[test]
+fn pending_click_cancellation_prevents_a_ghost_double_click() {
+    let now = Instant::now();
+    for command in [
+        ButtonCommand::CancelHooks,
+        ButtonCommand::CancelSource(ButtonSource::current_hook()),
+    ] {
+        let mut state = ButtonState::default();
+        let mut events = Vec::new();
+        let first = double_click_press(1, now);
+        input_at(&mut state, &first, None, &mut events);
+        input_at(
+            &mut state,
+            &first,
+            Some(now + Duration::from_millis(30)),
+            &mut events,
+        );
+        process_command(&mut state, command, 0, &mut |event| events.push(event));
+        let second = double_click_press(2, now + Duration::from_millis(100));
+        input_at(&mut state, &second, None, &mut events);
+        input_at(
+            &mut state,
+            &second,
+            Some(now + Duration::from_millis(130)),
+            &mut events,
+        );
+        emit_due_long_presses(&mut state, now + Duration::from_secs(1), &mut |event| {
+            events.push(event);
+        });
+        assert!(output_actions(&events).is_empty());
+    }
+}
+
+#[test]
+fn double_clicks_do_not_cross_controls_or_capture_sessions() {
+    let now = Instant::now();
+    let mut state = ButtonState::default();
+    let mut events = Vec::new();
+    let first = double_click_press(1, now);
+    input_at(&mut state, &first, None, &mut events);
+    input_at(
+        &mut state,
+        &first,
+        Some(now + Duration::from_millis(30)),
+        &mut events,
+    );
+    let mut second = double_click_press(2, now + Duration::from_millis(100));
+    second.token.key.source = ButtonSource::Hidpp(HidppSessionId::with_epoch("other", 1));
+    input_at(&mut state, &second, None, &mut events);
+    input_at(
+        &mut state,
+        &second,
+        Some(now + Duration::from_millis(130)),
+        &mut events,
+    );
+    emit_due_long_presses(&mut state, now + Duration::from_secs(1), &mut |event| {
+        events.push(event);
+    });
+    assert!(output_actions(&events).is_empty());
+}
+
+#[test]
+fn three_button_actions_dispatch_independently_on_every_captured_button() {
+    for button in [
+        ButtonId::MiddleClick,
+        ButtonId::Back,
+        ButtonId::Forward,
+        ButtonId::DpiToggle,
+        ButtonId::GestureButton,
+    ] {
+        let now = Instant::now();
+        let binding = ButtonActions::new(Action::Copy, Action::Paste, Action::Undo).into_binding();
+        let press_at = |id, at| {
+            let mut press = hook_press(id, button);
+            press.behavior = PressBehavior::new(Some(&binding), at);
+            press
+        };
+        // One click waits for the double-click interval, then fires only Copy.
+        let mut state = ButtonState::default();
+        let mut events = Vec::new();
+        let first = press_at(1, now);
+        input_at(&mut state, &first, None, &mut events);
+        input_at(
+            &mut state,
+            &first,
+            Some(now + Duration::from_millis(30)),
+            &mut events,
+        );
+        emit_due_long_presses(&mut state, now + Duration::from_millis(229), &mut |event| {
+            events.push(event);
+        });
+        assert!(output_actions(&events).is_empty());
+        emit_due_long_presses(&mut state, now + Duration::from_millis(230), &mut |event| {
+            events.push(event);
+        });
+        assert_eq!(output_actions(&events), [Action::Copy]);
+        // A second short press within 200 ms replaces both single clicks.
+        let mut state = ButtonState::default();
+        let mut events = Vec::new();
+        input_at(&mut state, &first, None, &mut events);
+        input_at(
+            &mut state,
+            &first,
+            Some(now + Duration::from_millis(30)),
+            &mut events,
+        );
+        let second = press_at(2, now + Duration::from_millis(230));
+        input_at(&mut state, &second, None, &mut events);
+        input_at(
+            &mut state,
+            &second,
+            Some(now + Duration::from_millis(250)),
+            &mut events,
+        );
+        emit_due_long_presses(&mut state, now + Duration::from_secs(1), &mut |event| {
+            events.push(event);
+        });
+        assert_eq!(output_actions(&events), [Action::Undo]);
+        // A hold fires at 300 ms and its release never fires Copy or Undo.
+        let mut state = ButtonState::default();
+        let mut events = Vec::new();
+        input_at(&mut state, &first, None, &mut events);
+        emit_due_long_presses(&mut state, now + Duration::from_millis(299), &mut |event| {
+            events.push(event);
+        });
+        assert!(output_actions(&events).is_empty());
+        emit_due_long_presses(&mut state, now + Duration::from_millis(300), &mut |event| {
+            events.push(event);
+        });
+        input_at(
+            &mut state,
+            &first,
+            Some(now + Duration::from_millis(350)),
+            &mut events,
+        );
+        assert_eq!(output_actions(&events), [Action::Paste]);
+    }
 }

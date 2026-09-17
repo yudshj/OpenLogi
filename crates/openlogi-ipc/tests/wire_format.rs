@@ -31,7 +31,7 @@ use std::fmt::Write;
 
 use bincode::Options;
 use openlogi_core::app::ForegroundApp;
-use openlogi_core::binding::{ActionRingIcon, ActionRingSlot};
+use openlogi_core::binding::{Action, ActionRingIcon, ActionRingSlot};
 use openlogi_core::config::{Lighting, ScrollResolution};
 use openlogi_core::device::{
     BatteryInfo, BatteryLevel, BatteryStatus, Capabilities, DeviceInventory, DeviceKind,
@@ -102,7 +102,17 @@ fn representative_smartshift_status() -> SmartShiftStatus {
 /// that makes that visible in the same diff.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 30);
+    assert_eq!(PROTOCOL_VERSION, 34);
+}
+
+#[test]
+fn globe_action_is_appended_without_moving_existing_actions() {
+    assert_wire(&Action::Copy, "06");
+    assert_wire(
+        &Action::HoldShortcut("Ctrl+Space".parse().unwrap()),
+        "34042c",
+    );
+    assert_wire(&Action::HoldGlobeKey, "35");
 }
 
 #[test]
@@ -438,12 +448,13 @@ fn device_inventory() {
                 thumbwheel: true,
                 haptic_feedback: true,
                 haptic_panel: true,
+                dpi_gestures: true,
             }),
         }],
     }];
     assert_wire(
         &inventory,
-        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b000010150020001030106323134304c5a0102030400010100fb34b0fb8240000b010101000001010101",
+        "010d426f6c74205265636569766572fb6d04fb48c501084630304443414645010101094d58204d535452335301fb34b000010150020001030106323134304c5a0102030400010100fb34b0fb8240000b01010100000101010101",
     );
 }
 
@@ -642,4 +653,37 @@ fn standalone_light_dtos_commands_and_errors() {
         "0c05636f6c6f72",
     );
     assert_wire(&WriteError::AmbiguousRawDevice, "0d");
+}
+
+#[test]
+fn double_click_shortcut_is_appended_to_long_press_wire_fields() {
+    use openlogi_core::binding::LongPressBinding;
+    assert_wire(
+        &LongPressBinding::new(Action::Copy, Action::Paste),
+        "060700",
+    );
+    assert_wire(
+        &LongPressBinding::new(Action::None, Action::HoldGlobeKey)
+            .with_double_click("Ctrl+Alt+Shift+T".parse().unwrap()),
+        "0035010e17",
+    );
+}
+
+#[test]
+fn generic_fn_keys_preserve_existing_shortcut_wire_encodings() {
+    use openlogi_core::binding::KeyCombo;
+    assert_wire(&KeyCombo::FN, "1000");
+    assert_wire(&"Fn+T".parse::<KeyCombo>().unwrap(), "1017");
+    assert_wire(&"Ctrl".parse::<KeyCombo>().unwrap(), "0400");
+    assert_wire(&"⌃⌥⇧T".parse::<KeyCombo>().unwrap(), "0e17");
+    assert_wire(&Action::HoldShortcut(KeyCombo::FN), "341000");
+}
+
+#[test]
+fn three_button_actions_have_independent_wire_fields() {
+    use openlogi_core::binding::ButtonActions;
+    assert_wire(
+        &ButtonActions::new(Action::Copy, Action::Paste, Action::None),
+        "060700",
+    );
 }

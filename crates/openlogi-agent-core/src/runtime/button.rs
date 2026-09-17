@@ -14,8 +14,12 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
-use openlogi_core::binding::{Action, Binding, ButtonId, LONG_PRESS_THRESHOLD};
+use openlogi_core::binding::{
+    Action, Binding, ButtonId, ButtonPress, DOUBLE_CLICK_HOLD_THRESHOLD, DOUBLE_CLICK_INTERVAL,
+};
 use tracing::warn;
+
+use super::ActionDispatchTarget;
 
 /// OS-hook callbacks must fail open rather than block.
 const EVENT_QUEUE_CAPACITY: usize = 128;
@@ -152,6 +156,13 @@ pub(crate) struct PressToken {
     generation: u64,
 }
 
+impl PressToken {
+    /// Process-local correlation number, without capture/device identity.
+    pub(crate) fn sequence(&self) -> u64 {
+        self.id.0
+    }
+}
+
 #[cfg(test)]
 impl PressToken {
     pub(crate) fn hook_for_test(id: u64, button: ButtonId) -> Self {
@@ -168,6 +179,7 @@ impl PressToken {
 pub(crate) struct ActivePress {
     token: PressToken,
     behavior: PressBehavior,
+    target: ActionDispatchTarget,
 }
 
 /// Runtime-only state of the action semantics attached to one active press.
@@ -181,6 +193,8 @@ enum PressBehavior {
     LongPressPending {
         short: Action,
         long: Action,
+        double_click: Option<Action>,
+        pressed_at: Instant,
         deadline: Instant,
     },
     /// The long action fired; release must not also fire the short action.
@@ -196,7 +210,17 @@ impl PressBehavior {
             Some(Binding::LongPress(binding)) => Self::LongPressPending {
                 short: binding.short().clone(),
                 long: binding.long().clone(),
-                deadline: pressed_at + LONG_PRESS_THRESHOLD,
+                double_click: binding.double_click().cloned().map(Action::CustomShortcut),
+                pressed_at,
+                deadline: pressed_at + binding.hold_threshold(),
+            },
+            Some(Binding::Clicks(actions)) => Self::LongPressPending {
+                short: actions.action(ButtonPress::Click).clone(),
+                long: actions.action(ButtonPress::Hold).clone(),
+                double_click: (actions.action(ButtonPress::DoubleClick) != &Action::None)
+                    .then(|| actions.action(ButtonPress::DoubleClick).clone()),
+                pressed_at,
+                deadline: pressed_at + DOUBLE_CLICK_HOLD_THRESHOLD,
             },
         }
     }
@@ -250,6 +274,14 @@ impl ActivePress {
 
     pub(crate) fn start_action(&self) -> Option<&Action> {
         self.behavior.start_action()
+    }
+
+    pub(crate) fn is_long_fired(&self) -> bool {
+        matches!(self.behavior, PressBehavior::LongPressFired)
+    }
+
+    pub(crate) fn target(&self) -> ActionDispatchTarget {
+        self.target
     }
 
     fn release_action(&self) -> Option<&Action> {
@@ -324,6 +356,48 @@ struct ShutdownRequest {
 #[derive(Default)]
 struct ButtonState {
     active: HashMap<PressKey, ActivePress>,
+    waiting: HashMap<PressKey, PendingClick>,
+}
+
+/// A released first click retains its lifecycle until the second click or timeout.
+struct PendingClick {
+    press: ActivePress,
+    deadline: Instant,
+}
+
+impl PendingClick {
+    fn pair_with(&self, next: &mut ActivePress) -> bool {
+        let PressBehavior::LongPressPending {
+            short,
+            long,
+            double_click: Some(combo),
+            ..
+        } = &self.press.behavior
+        else {
+            return false;
+        };
+        let PressBehavior::LongPressPending {
+            short: next_short,
+            long: next_long,
+            double_click,
+            pressed_at,
+            ..
+        } = &mut next.behavior
+        else {
+            return false;
+        };
+        if *pressed_at > self.deadline
+            || self.press.target != next.target
+            || short != next_short
+            || long != next_long
+            || double_click.as_ref() != Some(combo)
+        {
+            return false;
+        }
+        *next_short = combo.clone();
+        *double_click = None;
+        true
+    }
 }
 
 impl ButtonState {
@@ -342,8 +416,17 @@ impl ButtonState {
     }
 
     fn cancel_press(&mut self, token: &PressToken) -> Option<ActivePress> {
-        self.active(token)?;
-        self.active.remove(&token.key)
+        if self.active(token).is_some() {
+            self.active.remove(&token.key)
+        } else if self
+            .waiting
+            .get(&token.key)
+            .is_some_and(|click| click.press.token == *token)
+        {
+            self.waiting.remove(&token.key).map(|click| click.press)
+        } else {
+            None
+        }
     }
 
     fn cancel_source(&mut self, source: &ButtonSource) -> Vec<ActivePress> {
@@ -355,7 +438,11 @@ impl ButtonState {
     }
 
     fn cancel_all(&mut self) -> Vec<ActivePress> {
-        self.active.drain().map(|(_, press)| press).collect()
+        self.active
+            .drain()
+            .map(|(_, press)| press)
+            .chain(self.waiting.drain().map(|(_, click)| click.press))
+            .collect()
     }
 
     fn fire_selected_long_presses(
@@ -379,6 +466,7 @@ impl ButtonState {
         self.active
             .values()
             .filter_map(|press| press.behavior.deadline())
+            .chain(self.waiting.values().map(|click| click.deadline))
             .any(|deadline| deadline <= now)
     }
 
@@ -392,6 +480,12 @@ impl ButtonState {
                     .is_some_and(|deadline| deadline <= now)
             })
             .map(|press| press.token.clone())
+            .chain(
+                self.waiting
+                    .values()
+                    .filter(|click| click.deadline <= now)
+                    .map(|click| click.press.token.clone()),
+            )
             .collect()
     }
 
@@ -402,8 +496,19 @@ impl ButtonState {
             .filter(|key| matches(key))
             .cloned()
             .collect();
+        let waiting_keys: Vec<_> = self
+            .waiting
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect();
         keys.into_iter()
             .filter_map(|key| self.active.remove(&key))
+            .chain(
+                waiting_keys
+                    .into_iter()
+                    .filter_map(|key| self.waiting.remove(&key).map(|click| click.press)),
+            )
             .collect()
     }
 }
@@ -418,24 +523,40 @@ pub(crate) struct ButtonInputHandle {
 }
 
 impl ButtonInputHandle {
+    #[cfg(test)]
     pub(crate) fn try_hook_down(
         &self,
         button: ButtonId,
         binding: Option<&Binding>,
     ) -> Option<PressToken> {
-        self.try_down(ButtonSource::current_hook(), button, binding)
+        self.try_hook_down_with_target(button, binding, ActionDispatchTarget::capture())
+    }
+
+    pub(crate) fn try_hook_down_with_target(
+        &self,
+        button: ButtonId,
+        binding: Option<&Binding>,
+        target: ActionDispatchTarget,
+    ) -> Option<PressToken> {
+        self.try_down(ButtonSource::current_hook(), button, binding, target)
     }
 
     pub(crate) fn try_hook_up(&self, button: ButtonId) -> bool {
         self.try_up(ButtonSource::current_hook(), button)
     }
 
-    pub(crate) fn try_hook_key_down(&self, keycode: u16, action: &Action) -> Option<PressToken> {
+    pub(crate) fn try_hook_key_down(
+        &self,
+        keycode: u16,
+        action: &Action,
+        target: ActionDispatchTarget,
+    ) -> Option<PressToken> {
         let generation = self.generation.load(Ordering::Acquire);
         let press = self.new_press(
             PressKey::for_key(ButtonSource::current_hook(), keycode),
             PressBehavior::Immediate(action.clone()),
             generation,
+            target,
         );
         let token = press.token.clone();
         self.try_input(generation, ButtonInput::Down(press))
@@ -466,8 +587,14 @@ impl ButtonInputHandle {
         session: &HidppSessionId,
         button: ButtonId,
         binding: Option<&Binding>,
+        target: ActionDispatchTarget,
     ) -> Option<PressToken> {
-        self.try_down(ButtonSource::Hidpp(session.clone()), button, binding)
+        self.try_down(
+            ButtonSource::Hidpp(session.clone()),
+            button,
+            binding,
+            target,
+        )
     }
 
     pub(crate) fn try_hidpp_up(&self, session: &HidppSessionId, button: ButtonId) -> bool {
@@ -479,12 +606,26 @@ impl ButtonInputHandle {
         session: &HidppSessionId,
         button: ButtonId,
         binding: Option<&Binding>,
+        target: ActionDispatchTarget,
     ) -> bool {
+        if binding.is_some_and(|binding| {
+            binding.click_action().requires_physical_release()
+                || matches!(binding, Binding::Clicks(_))
+                || matches!(binding, Binding::LongPress(long) if long.double_click().is_some())
+        }) {
+            warn!(
+                action = "HoldGlobeKey",
+                reason = "pulse_only_source",
+                "held input rejected"
+            );
+            return false;
+        }
         let generation = self.generation.load(Ordering::Acquire);
         let press = self.new_press(
             PressKey::new(ButtonSource::Hidpp(session.clone()), button),
             PressBehavior::new(binding, Instant::now()),
             generation,
+            target,
         );
         self.try_input(generation, ButtonInput::Pulse(press))
     }
@@ -523,12 +664,14 @@ impl ButtonInputHandle {
         source: ButtonSource,
         button: ButtonId,
         binding: Option<&Binding>,
+        target: ActionDispatchTarget,
     ) -> Option<PressToken> {
         let generation = self.generation.load(Ordering::Acquire);
         let press = self.new_press(
             PressKey::new(source, button),
             PressBehavior::new(binding, Instant::now()),
             generation,
+            target,
         );
         let token = press.token.clone();
         self.try_input(generation, ButtonInput::Down(press))
@@ -546,7 +689,13 @@ impl ButtonInputHandle {
         )
     }
 
-    fn new_press(&self, key: PressKey, behavior: PressBehavior, generation: u64) -> ActivePress {
+    fn new_press(
+        &self,
+        key: PressKey,
+        behavior: PressBehavior,
+        generation: u64,
+        target: ActionDispatchTarget,
+    ) -> ActivePress {
         let id = PressId(self.next_press.fetch_add(1, Ordering::Relaxed));
         ActivePress {
             token: PressToken {
@@ -555,6 +704,7 @@ impl ButtonInputHandle {
                 generation,
             },
             behavior,
+            target,
         }
     }
 
@@ -901,7 +1051,17 @@ fn process_input(
     emit: &mut impl FnMut(ButtonRuntimeEvent),
 ) {
     match input {
-        ButtonInput::Down(press) => {
+        ButtonInput::Down(mut press) => {
+            if let Some(click) = state.waiting.remove(&press.token.key) {
+                if click.pair_with(&mut press) {
+                    emit(ButtonRuntimeEvent::Ended {
+                        press: click.press,
+                        reason: EndReason::Released,
+                    });
+                } else {
+                    emit_released(click.press, emit);
+                }
+            }
             if let Some(stale) = state.press(press.clone()) {
                 emit(ButtonRuntimeEvent::Ended {
                     press: stale,
@@ -912,13 +1072,31 @@ fn process_input(
         }
         ButtonInput::Up { key, released_at } => {
             if let Some(mut press) = state.release(&key) {
-                if let Some(action) = press.fire_long(released_at) {
+                if let Some(action) = press.fire_long(released_at)
+                    && action.held_input().is_none()
+                {
                     emit(ButtonRuntimeEvent::Triggered {
                         press: press.clone(),
                         action,
                     });
                 }
-                emit_released(press, emit);
+                if matches!(
+                    press.behavior,
+                    PressBehavior::LongPressPending {
+                        double_click: Some(_),
+                        ..
+                    }
+                ) {
+                    state.waiting.insert(
+                        key,
+                        PendingClick {
+                            press,
+                            deadline: released_at + DOUBLE_CLICK_INTERVAL,
+                        },
+                    );
+                } else {
+                    emit_released(press, emit);
+                }
             }
         }
         ButtonInput::Pulse(press) => {
@@ -947,6 +1125,16 @@ fn emit_selected_long_presses(
     now: Instant,
     emit: &mut impl FnMut(ButtonRuntimeEvent),
 ) {
+    for token in tokens {
+        if state
+            .waiting
+            .get(&token.key)
+            .is_some_and(|click| click.press.token == *token && click.deadline <= now)
+            && let Some(click) = state.waiting.remove(&token.key)
+        {
+            emit_released(click.press, emit);
+        }
+    }
     for (press, action) in state.fire_selected_long_presses(tokens, now) {
         emit(ButtonRuntimeEvent::Triggered { press, action });
     }

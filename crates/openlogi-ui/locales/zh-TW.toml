@@ -2,6 +2,7 @@
 _version = 1
 
 [common]
+confirm = "Confirm"
 grid = "網格"
 list = "列表"
 carousel = "輪播"
@@ -235,6 +236,23 @@ wheel_resolution_other_connection = "此裝置使用另一種連線時支援滾�
 smartshift = "SmartShift"
 
 [actions]
+single_click = "Single click"
+long_press = "Long press"
+double_click = "Double click"
+hold_delay = "%{ms} ms"
+hold_immediate = "On press"
+double_click_delay = "Within 200 ms"
+keyboard_shortcut = "Keyboard shortcut…"
+keyboard_shortcut_title = "Keyboard shortcut"
+shortcut_preview = "Preview"
+multiple_actions = "Multiple actions"
+choose_keyboard_keys = "Choose at least one modifier or key."
+ordinary_key = "Ordinary key"
+modifiers_only = "No ordinary key"
+press_keyboard_keys = "Press keyboard keys…"
+hold_keyboard_keys = "Hold keyboard keys…"
+keyboard_keys_help = "Choose modifiers and a key. Fn can be used on its own."
+hold_globe_key = "地球鍵 / Fn（按住，macOS）"
 bind_control = "設定 %{name}"
 bind_control_in_app = "在 %{app} 中設定 %{name}"
 unbound = "未設定"
@@ -308,6 +326,7 @@ native_controls_when_disabled = "關閉後，所有控制項會維持原有功�
 overridden_in_app = "已在 %{app} 中覆寫"
 use_a_single_action = "使用單一動作"
 use_gestures = "使用手勢"
+dpi_gestures_unavailable = "尚未偵測到此裝置支援 DPI 按鈕手勢。"
 action_key_summary = "%{action} · %{key}"
 search_actions = "搜尋動作…"
 workflow_key_summary = "工作流程 · %{key}"
@@ -479,6 +498,8 @@ input_interception_detected = "另一個應用程式正在攔截滑鼠輸入，�
 [camera]
 camera = "攝影機"
 starting_preview = "正在啟動預覽…"
+camera_resources_unavailable = "攝影機資源無法使用。其他應用程式可能正在使用攝影機。"
+camera_preview_start_failed = "無法啟動攝影機預覽。"
 camera_preview_permission_required = "在設定中啟用攝影機存取權限即可預覽。"
 click_to_enable_camera_access = "點擊以啟用攝影機存取。"
 brightness = "亮度"

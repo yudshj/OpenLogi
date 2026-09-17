@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use gpui::App;
-use openlogi_core::binding::{Action, Binding, ButtonId, GestureDirection};
+use openlogi_core::binding::{
+    Action, Binding, ButtonActions, ButtonId, ButtonPress, GestureDirection,
+};
 use openlogi_core::bindings::{bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
 use openlogi_core::config::{Config, KeyTrigger};
 use tracing::debug;
@@ -88,7 +90,7 @@ fn gesture_maps_for(
     let Some(key) = persistent_key else {
         return BTreeMap::new();
     };
-    let mut maps = hidpp_gesture_maps_for(config, Some(key));
+    let mut maps = hidpp_gesture_maps_for(config, Some(key), None);
     maps.extend(oshook_gestures_for(config, Some(key), None));
     maps
 }
@@ -224,6 +226,39 @@ impl AppState {
         });
         // The agent owns the hook; have it rebuild its live map from config.
         self.persist_and_reload("binding");
+    }
+
+    /// Default-profile binding for the selected device, without flattening timed actions.
+    pub(crate) fn default_button_binding(&self, button: ButtonId) -> Option<&Binding> {
+        let key = self.current_record()?.persistent_config_key()?;
+        self.config.devices.get(key)?.bindings.get(&button)
+    }
+
+    /// Change one activation without overwriting the other two or another device.
+    pub(crate) fn commit_button_action(
+        &mut self,
+        device_key: &str,
+        button: ButtonId,
+        press: ButtonPress,
+        action: Action,
+    ) {
+        if self.editing_app().is_some()
+            || self
+                .current_record()
+                .and_then(DeviceRecord::persistent_config_key)
+                != Some(device_key)
+            || (press != ButtonPress::Hold && action.requires_physical_release())
+        {
+            return;
+        }
+        let fallback = Binding::Single(openlogi_core::binding::default_binding(button));
+        let mut actions =
+            ButtonActions::from_binding(self.default_button_binding(button).unwrap_or(&fallback));
+        actions.set_action(press, action);
+        self.config
+            .edit(|config| config.set_binding(device_key, button, actions.into_binding()));
+        self.refresh_binding_projections();
+        self.persist_and_reload("button action");
     }
 
     /// Drop `button`'s override in the open per-app profile, so it inherits the
@@ -382,6 +417,20 @@ impl AppState {
     /// independently of every other button. Persists, tells the agent to
     /// rebuild, and refreshes the projected maps the UI reads.
     pub fn commit_gesture_mode(&mut self, button: ButtonId, enabled: bool) {
+        if enabled && !button.supports_gesture_mode() {
+            debug!(?button, "gesture mode is not supported for this control");
+            return;
+        }
+        if enabled
+            && button == ButtonId::DpiToggle
+            && !self
+                .current_record()
+                .and_then(|record| record.capabilities)
+                .is_some_and(|caps| caps.dpi_gestures)
+        {
+            debug!("DPI gestures require measured raw-XY support");
+            return;
+        }
         let Some(key) = self
             .current_record()
             .and_then(DeviceRecord::persistent_config_key)
@@ -428,6 +477,12 @@ impl AppState {
             );
             return;
         };
+        let is_gesture_mode = self.config.is_gesture_mode(&key, button);
+        let is_stored_os_hook_gesture = button.is_os_hook_button() && is_gesture_mode;
+        if !button.supports_gesture_mode() && !is_stored_os_hook_gesture {
+            debug!(?button, "gestures are not supported for this control");
+            return;
+        }
         // Same backstop as `commit_gesture_mode`: direction maps live only in
         // the global profile, so an edit arriving while a per-app one is open
         // would change every app instead of the one on screen.
@@ -441,8 +496,10 @@ impl AppState {
         }
         // A stray edit on a button not in gesture mode must NOT silently
         // promote it (the gesture editor shouldn't be reachable in that
-        // state): no-op instead.
-        if !self.config.is_gesture_mode(&key, button) {
+        // state): no-op instead. Checking the stored mode rather than the
+        // current enablement policy keeps v0.8.0 Middle Click gesture maps
+        // editable until the user explicitly turns them off.
+        if !is_gesture_mode {
             debug!(
                 ?button,
                 ?direction,
